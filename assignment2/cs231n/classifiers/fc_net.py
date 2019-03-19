@@ -130,6 +130,37 @@ class TwoLayerNet(object):
         return loss, grads
 
 
+def affine_bn_relu_forward(x, w, b, gamma, beta, bn_param):
+    """
+    Convenience layer that performs an affine transform followed by a batch-norm and a ReLU
+
+    Inputs:
+    - x: Input to the affine layer
+    - w, b: Weights for the affine layer
+    - gamma, beta, bn_params: params for the batch norm layer
+
+    Returns a tuple of:
+    - out: Output from the ReLU
+    - cache: Object to give to the backward pass
+    """
+    a, fc_cache = affine_forward(x, w, b)
+    bn, bn_cache = batchnorm_forward(a, gamma, beta, bn_param)
+    out, relu_cache = relu_forward(bn)
+    cache = (fc_cache, bn_cache, relu_cache)
+    return out, cache
+
+
+def affine_bn_relu_backward(dout, cache):
+    """
+    Backward pass for the affine-batchnorm-relu convenience layer
+    """
+    fc_cache, bn_cache, relu_cache = cache
+    dbn = relu_backward(dout, relu_cache)
+    da, dgamma, dbeta = batchnorm_backward_alt(dbn, bn_cache)
+    dx, dw, db = affine_backward(da, fc_cache)
+    return dx, dw, db, dgamma, dbeta
+
+
 class FullyConnectedNet(object):
     """
     A fully-connected neural network with an arbitrary number of hidden layers,
@@ -190,14 +221,24 @@ class FullyConnectedNet(object):
         # parameters should be initialized to zeros.                               #
         ############################################################################
         # First layer
-        self.params['W0'] = np.random.normal(scale=weight_scale, size=(input_dim, hidden_dims[0]))
-        self.params['b0'] = np.zeros((1, hidden_dims[0]))
+        self.params['W1'] = np.random.normal(scale=weight_scale, size=(input_dim, hidden_dims[0]))
+        self.params['b1'] = np.zeros((1, hidden_dims[0]))
+        if self.normalization == 'batchnorm':
+            self.params['gamma1'] = np.ones(hidden_dims[0])
+            self.params['beta1'] = np.zeros(hidden_dims[0])
+
+        # Intermediate layers
         for i in range(1, self.num_layers - 1):
-            self.params[f'W{i}'] = np.random.normal(scale=weight_scale, size=(hidden_dims[i-1], hidden_dims[i]))
-            self.params[f'b{i}'] = np.zeros((1, hidden_dims[i]))
+            self.params[f'W{i+1}'] = np.random.normal(scale=weight_scale, size=(hidden_dims[i-1], hidden_dims[i]))
+            self.params[f'b{i+1}'] = np.zeros((1, hidden_dims[i]))
+            if self.normalization == 'batchnorm':
+                self.params[f'gamma{i+1}'] = np.ones(hidden_dims[i])
+                self.params[f'beta{i+1}'] = np.zeros(hidden_dims[i])
+
         # Final layer
-        self.params[f'W{i+1}'] = np.random.normal(scale=weight_scale, size=(hidden_dims[i], num_classes))
-        self.params[f'b{i+1}'] = np.zeros((1, num_classes))
+        self.params[f'W{self.num_layers}'] = \
+            np.random.normal(scale=weight_scale, size=(hidden_dims[self.num_layers-2], num_classes))
+        self.params[f'b{self.num_layers}'] = np.zeros((1, num_classes))
         ############################################################################
         #                             END OF YOUR CODE                             #
         ############################################################################
@@ -259,12 +300,22 @@ class FullyConnectedNet(object):
         # forward pass
         caches = []
         tensor = X
+
         for i in range(self.num_layers - 1):
-            tensor, cache = affine_relu_forward(tensor, self.params[f'W{i}'], self.params[f'b{i}'])
+            if self.normalization == 'batchnorm':
+                tensor, cache = affine_bn_relu_forward(tensor,  self.params[f'W{i+1}'], self.params[f'b{i+1}'],
+                                                       self.params[f'gamma{i+1}'], self.params[f'beta{i+1}'],
+                                                       self.bn_params[i])
+            else:
+                tensor, cache = affine_relu_forward(tensor, self.params[f'W{i+1}'], self.params[f'b{i+1}'])
             caches.append(cache)
 
-        i += 1
-        scores, cache = affine_forward(tensor, self.params[f'W{i}'], self.params[f'b{i}'])
+            # dropout
+            if self.use_dropout:
+                tensor, cache = dropout_forward(tensor, self.dropout_param)
+                caches.append(cache)
+
+        scores, cache = affine_forward(tensor, self.params[f'W{self.num_layers}'], self.params[f'b{self.num_layers}'])
         caches.append(cache)
         ############################################################################
         #                             END OF YOUR CODE                             #
@@ -294,16 +345,23 @@ class FullyConnectedNet(object):
         # Add regularization
         R = lambda w: np.sum(w * w)
         for i in range(self.num_layers):
-            loss += self.reg * 0.5 * R(self.params[f'W{i}'])
+            loss += self.reg * 0.5 * R(self.params[f'W{i+1}'])
 
         # Backprop
-        # caches.reverse()
-        dout, grads[f'W{i}'], grads[f'b{i}'] = affine_backward(dout, caches[i])
-        grads[f'W{i}'] += self.reg * self.params[f'W{i}']
+        dout, grads[f'W{i+1}'], grads[f'b{i+1}'] = affine_backward(dout, caches.pop())
+        grads[f'W{i+1}'] += self.reg * self.params[f'W{i+1}']
         for i in range(self.num_layers - 2, -1, -1):
-            dout, grads[f'W{i}'], grads[f'b{i}'] = affine_relu_backward(dout, caches[i])
+            # dropout
+            if self.use_dropout:
+                dout = dropout_backward(dout, caches.pop())
+
+            if self.normalization == 'batchnorm':
+                dout, dw, db, grads[f'gamma{i+1}'], grads[f'beta{i+1}'] = affine_bn_relu_backward(dout, caches.pop())
+            else:
+                dout, dw, db = affine_relu_backward(dout, caches.pop())
             # Add regularization -
-            grads[f'W{i}'] += self.reg * self.params[f'W{i}']
+            grads[f'W{i+1}'] = dw + self.reg * self.params[f'W{i+1}']
+            grads[f'b{i+1}'] = db
 
         ############################################################################
         #                             END OF YOUR CODE                             #
